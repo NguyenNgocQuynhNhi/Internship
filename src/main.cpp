@@ -1,96 +1,93 @@
-#include <HardwareSerial.h>
+#define TINY_GSM_MODEM_SIM7600  // A7682S tương thích SIM7600
+#define TINY_GSM_USE_UART true  // Bắt buộc khi dùng Serial2
 
-#define BAUDRATE        115200
+#include <Arduino.h>
+#include <TinyGsmClient.h>
+#include <PubSubClient.h>
 
-#define LED_PIN         2
-#define SIM_ENABLE_PIN  15
-#define SIM_TX_PIN      17
-#define SIM_RX_PIN      16
+#define BAUDRATE            115200
 
+#define LED_PIN             2
+#define SIM_ENABLE_PIN      15
+#define SIM_TX_PIN          17
+#define SIM_RX_PIN          16
+#define SERIAL_MONITOR      Serial
+#define SERIAL_AT           Serial2
 
+const char apn[]  = "m-wap.mobifone.com.vn"; // hoặc "m3-world"
+const char user[] = "";
+const char pass[] = "";
 
-// HardwareSerial SerialAT(1); // UART1
-HardwareSerial SerialAT(2); // UART2
+TinyGsm modem(SERIAL_AT);
+TinyGsmClient client(modem);
+PubSubClient mqtt(client);
+
+const char* broker = "broker.emqx.io";
+const int   port   = 1883;
+const char* topic  = "LTE";
 
 void enableModuleSIM();
 void setPinLED();
 void turnOnLED();
-void sendATCommand(String command, int wait = 1000);
+void mqttCallback(char* topic, byte* payload, unsigned int len);
+const char* simStatusToStr(SimStatus s);
+
 
 void setup() {
-    Serial.begin(BAUDRATE);
+    SERIAL_MONITOR.begin(BAUDRATE);
     setPinLED();
-    SerialAT.begin(BAUDRATE, SERIAL_8N1, SIM_RX_PIN, SIM_TX_PIN); // Rx, Tx của ESP32
-    delay(3000);
-
+    SERIAL_AT.begin(BAUDRATE, SERIAL_8N1, SIM_RX_PIN, SIM_TX_PIN);
+    delay(2000);
     enableModuleSIM();
 
-    Serial.println("Send AT command to module A7682S...");
-    //SerialAT.println("AT"); // Gửi lệnh kiểm tra
-    sendATCommand("AT");
-    // sendATCommand("AT+CGDCONT=1,\"IP\",\"internet\"");          //configuration APN
-    sendATCommand("AT+CGDCONT=1,\"IP\",\"v-internet\"");        //configuration APN
-    delay(500);
-    sendATCommand("AT+CGACT=1,1");                              //activate PDP context
-    delay(500);
-    sendATCommand("AT+CGPADDR=1");                              //check IP
+    SERIAL_MONITOR.println("[MODEM] Restarting....");
+    modem.restart();
 
-    sendATCommand("AT+CMQTTSTART");                             //initialize MQTT
-    sendATCommand("AT+CMQTTACCQ=0,\"mqttx_1a834cef\"");         //create client
-    sendATCommand("AT+CMQTTCONNECT=0,\"tcp://broker.emqx.io:1883\",60,1");      //connect MQTT broker
+    SimStatus simStatus = modem.getSimStatus();
+    SERIAL_MONITOR.print("[MODEM] Sim status: ");
+    SERIAL_MONITOR.println(simStatusToStr(simStatus));
 
-    //send data
-    sendATCommand("AT+CMQTTTOPIC=0,18"); // 18 là độ dài topic
-    delay(100);
-    SerialAT.print("emqx/esp32-test");
+    SERIAL_MONITOR.println("[MODEM] Connecting to network....");
+    modem.gprsConnect(apn, user, pass);
 
-    sendATCommand("AT+CMQTTPAYLOAD=0,17"); // 17 là độ dài payload
-    delay(100);
-    SerialAT.print("hello from ESP32");
+    if (modem.isGprsConnected()) {
+        SERIAL_MONITOR.println("[MODEM] GPRS connected");
+    }
+    else {
+        SERIAL_MONITOR.println("[ERROR] GPRS failed");
+        return;
+    }
 
-    sendATCommand("AT+CMQTTPUBLISH=0,1,60");
+    mqtt.setServer(broker, port);
+    mqtt.setCallback(mqttCallback);
 
-
-
-
-
-    // sendATCommand("AT+SMCONF=\"URL\",\"broker.emqx.io\",1883"); //MQTT address and MQTT  port
-    // sendATCommand("AT+SMCONF=\"KEEPTIME\",60");                 //connecting time
-    // sendATCommand("AT+SMCONF=\"CLEANSS\",1");                   //clean session
-    // sendATCommand("AT+SMCONF=\"mqttx_1a834cef\",\"esp_mqtt_nhi\"");     //ID Client MQTT
-    // sendATCommand("AT+SMCONN");                                 //send command to connect MQTT
-
-
-    // sendATCommand("AT+SMCONF=\"URL\",\"broker.emqx.io\",1883");     //MQTT address and MQTT  port
-    // sendATCommand("AT+SMCONF=\"KEEPTIME\",60");                     //connecting time
-    // sendATCommand("AT+SMCONF=\"CLEANSS\",1");                       //clean session
-    // sendATCommand("AT+SMCONF=\"CLIENTID\",\"mqttx_1a834cef\"");     //ID Client MQTT
-    // sendATCommand("AT+SMCONF=\"USERNAME\",\"\"");                   // Nếu không cần xác thực
-    // sendATCommand("AT+SMCONF=\"PASSWORD\",\"\"");                   // Nếu không cần xác thực
-    // sendATCommand("AT+SMCONN");
-
-    // sendATCommand("AT+SMPUB=\"emqx/esp32-test\",17,1,0");
-    // delay(100);
-    // SerialAT.print("hello from ESP32");
-
-
-
-
-    // delay(1000);
-    // sendATCommand("AT+SMPUB=\"emqx/esp32-test\",17,1,0");
-    // delay(100);
-    // SerialAT.print("hello from ESP32");
 }
 
 void loop() {
-    // while (SerialAT.available()) {
-    //     Serial.write(SerialAT.read()); // In phản hồi từ module
-    //     // char c = SerialAT.read();
-    //     // Serial.print(c);
-    //     turnOnLED();
-    // }
+    if (!mqtt.connected()) {
+        SERIAL_MONITOR.println("[MQTT] Connecting....");
+        if (mqtt.connect("esp32Client")) {
+            SERIAL_MONITOR.println("[MQTT] Connected!");
+            mqtt.subscribe(topic);
+        }
+        else {
+            SERIAL_MONITOR.println("[MQTT] Failed, retrying....");
+            delay(5000);
+            return;
+        }
+    }
+
+    mqtt.loop();
+
+    static unsigned long lastSent = 0;
+    if (millis() - lastSent > 10000) {
+        lastSent = millis();
+        mqtt.publish(topic, "Hello from ESP32 + A7682S");
+    }
 }
 
+
+//-----------------------Function implementation---------------------------
 void enableModuleSIM() {
     pinMode(SIM_ENABLE_PIN, OUTPUT);
     digitalWrite(SIM_ENABLE_PIN, HIGH);
@@ -106,12 +103,32 @@ void turnOnLED() {
     digitalWrite(LED_PIN, HIGH);
 }
 
-void sendATCommand(String command, int wait) {
-    Serial.println(">>" + command);
-    SerialAT.println(command);
-    delay(wait);
-    while (SerialAT.available()) {
-        turnOnLED();
-        Serial.write(SerialAT.read());
+void mqttCallback(char* topic, byte* payload, unsigned int len) {
+    SERIAL_MONITOR.print("[MQTT] Message: ");
+    for (int i = 0; i < len; i++) {
+        SERIAL_MONITOR.print((char)payload[i]);
+    }
+    SERIAL_MONITOR.println();
+}
+
+const char* simStatusToStr(SimStatus s) {
+    switch (s)
+    {
+    case SimStatus::SIM_ERROR:      
+        return "SIM_ERROR";
+        break;
+    case SimStatus::SIM_LOCKED:
+        return "SIM_LOCKED";
+        break;
+    case SimStatus::SIM_READY:
+        return "SIM_READY";
+        break;
+    case SimStatus::SIM_ANTITHEFT_LOCKED:
+        return "SIM_ANTITHEFT_LOCKED";
+        break;
+    default:
+        return "UNKNOWN";
+        break;
     }
 }
+
